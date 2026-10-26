@@ -663,7 +663,12 @@ def build_headers(session):
         "X-User-Id": uid,
         "User-Agent": "WorkBuddy",
     }
-    if account.get("enterpriseId"):
+    # 企业（旗舰版）登录态不发企业上下文头：企业与个人是同一 uid 下的两种身份、
+    # 积分按 uid 记，而服务端在企业上下文下会拒绝签到等个人向活动
+    # （{"code":10001,"msg":"企业账号不支持该操作"}，issue #17）。
+    # account.type == "ultimate" 即企业旗舰版登录态（腾讯云文档：企业旗舰版/
+    # 专享版登录），此时 enterpriseId 仍会出现在凭据里，但不能带进请求头。
+    if account.get("enterpriseId") and account.get("type") != "ultimate":
         headers["X-Enterprise-Id"] = account["enterpriseId"]
         headers["X-Tenant-Id"] = account["enterpriseId"]
     if auth.get("domain"):

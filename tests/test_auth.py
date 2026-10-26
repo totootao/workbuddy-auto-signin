@@ -95,6 +95,36 @@ class AuthTests(unittest.TestCase):
         value["auth"]["domain"] = ""
         self.assertNotIn("X-Domain", signin.build_headers(signin.resolve_session(value)))
 
+    def test_enterprise_headers_skip_ultimate_accounts(self):
+        # issue #17：企业（旗舰版）与个人版是同一 uid 下的两种身份、积分按 uid 记，
+        # 服务端在企业上下文下拒绝签到。type=ultimate 的企业登录态不得携带
+        # X-Enterprise-Id/X-Tenant-Id；其余形态保持原样。
+        for account_type in (None, "personal", "pro"):
+            with self.subTest(type=account_type):
+                value = session()
+                value["account"].pop("enterpriseId", None)
+                if account_type:
+                    value["account"]["type"] = account_type
+                headers = signin.build_headers(signin.resolve_session(value))
+                self.assertNotIn("X-Enterprise-Id", headers)
+                self.assertNotIn("X-Tenant-Id", headers)
+        # 非 ultimate 且带 enterpriseId：照旧发送（回归护栏）
+        value = session()
+        value["account"]["type"] = "personal"
+        headers = signin.build_headers(signin.resolve_session(value))
+        self.assertEqual(headers["X-Enterprise-Id"], "synthetic-enterprise")
+        self.assertEqual(headers["X-Tenant-Id"], "synthetic-enterprise")
+        # ultimate 且带 enterpriseId：不发送
+        value = session()
+        value["account"]["type"] = "ultimate"
+        headers = signin.build_headers(signin.resolve_session(value))
+        self.assertNotIn("X-Enterprise-Id", headers)
+        self.assertNotIn("X-Tenant-Id", headers)
+        # 其余头部不受影响
+        self.assertEqual(headers["Authorization"], "Bearer synthetic-token")
+        self.assertEqual(headers["X-User-Id"], "synthetic-user")
+        self.assertEqual(headers["X-Domain"], "www.workbuddy.cn")
+
     def test_envelope_validation_before_runtime(self):
         invalid = [wrapper(suite=2), wrapper(suite=True), wrapper(keyId="Z" * 16),
                    wrapper(nonce="AA=="), wrapper(authTag="AA=="), wrapper(ciphertext="???"),
