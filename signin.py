@@ -13,9 +13,11 @@
 
 响应契约：
   - 领取成功 : 含 credit 字段，如 {"credit": 100}
-  - 今日已签 : null 或 HTTP 400 + {"code":10001,"msg":"今天已签到，请明天再来"}
-               幂等，两种形态都按"已签"处理，不计失败
-  - 业务错误 : {"code": ..., "msg": ...}
+  - 今日已签 : null 或 msg 含"已签"（曾见 HTTP 400 + {"code":10001,
+               "msg":"今天已签到，请明天再来"}）。幂等，按"已签"处理，不计失败。
+               注意 10001 不是"已签"专属——企业登录态被拒时同样是
+               {"code":10001,"msg":"企业账号不支持该操作"}，只认 msg 语义
+  - 业务错误 : {"code": ..., "msg": ...}（HTTP 状态可能是 200，需同时查业务码）
   - 认证拒绝 : HTTP 401；HTTP 403 单独作为权限/业务拒绝处理
 
 凭据文件由桌面端登录后自动写入；脚本按平台自动探测，或用环境变量
@@ -835,6 +837,22 @@ def dig(obj, key):
     return None
 
 
+def _is_business_error(body):
+    """HTTP 2xx 的响应体里也可能带业务错误码。
+
+    签到/查状态接口既有 200+{"credit":..} 的成功形态，也有
+    200+{"code":10001,"msg":"企业账号不支持该操作"} 的拒绝形态（issue #17）。
+    只看 HTTP 状态码会把后者计成成功——status/claim 两条调试命令因此要在
+    2xx 之外再查一道业务码，与 _is_already_checked_in 收紧后的判定保持一致。
+    """
+    if not isinstance(body, dict):
+        return False
+    code = body.get("code")
+    if code is None:
+        return False
+    return not (type(code) is int and code == 0)
+
+
 def _api_success(code, body):
     """补登相关接口同时检查 HTTP 状态和 JSON 业务码。"""
     business_code = body.get("code") if isinstance(body, dict) else None
@@ -1051,12 +1069,18 @@ def emit(out, action):
 
 
 def _is_already_checked_in(cbody):
-    """领取接口返回是否表示"今日已签"（兼容 null 与 400+code10001）。"""
+    """领取接口返回是否表示"今日已签"（兼容 null 与 400+已签语义）。
+
+    只认明确的"已签"文案：10001 不是"今日已签"专属——企业登录态下领取被拒
+    返回的同样是 10001（{"code":10001,"msg":"企业账号不支持该操作"}）。凭
+    code 判已签会把失败汇报成 ALREADY、退出码 0，无人值守下连签断了都看不出
+    异常（issue #17）。其余 10001 交给 run_auto 的业务错误分支如实报错。
+    """
     if cbody is None:
         return True
     if isinstance(cbody, dict):
         msg = cbody.get("msg") or ""
-        if cbody.get("code") == 10001 or "已签" in msg:
+        if "已签" in msg:
             return True
     return False
 
@@ -1779,9 +1803,11 @@ def _run(action):
         if scode in (401, 403):
             emit(dict(_auth_failure(scode), step="status"), action)
             return 1
+        # 2xx 里也可能带业务错误码（issue #17），不能只看 HTTP 状态
+        ok = 200 <= scode < 300 and not _is_business_error(sbody)
         emit({"step": "status", "http": scode, "body": sbody,
-              "needs_attention": not 200 <= scode < 300}, action)
-        if not 200 <= scode < 300:
+              "needs_attention": not ok}, action)
+        if not ok:
             return 1
 
     if action in ("claim", "all"):
@@ -1789,7 +1815,11 @@ def _run(action):
         if ccode in (401, 403):
             emit(dict(_auth_failure(ccode), step="claim"), action)
             return 1
-        success = 200 <= ccode < 300 or (ccode == 400 and _is_already_checked_in(cbody))
+        # "已签"语义在任何 HTTP 状态下都算领取成功（接口幂等）；其余情况必须
+        # 同时满足 2xx 且无业务错误码——企业态被拒时服务端返回 200+code10001，
+        # 旧判定会把它计成成功（issue #17）。
+        success = _is_already_checked_in(cbody) or (
+            200 <= ccode < 300 and not _is_business_error(cbody))
         emit({"step": "claim", "http": ccode, "body": cbody,
               "needs_attention": not success}, action)
         if not success:
